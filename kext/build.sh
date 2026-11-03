@@ -1,13 +1,15 @@
 #!/bin/bash
 # build.sh — build SMCNvidiaGPU.kext (VirtualSMC plugin, OpenCore-injected) without Xcode or a KDK.
 #
-# Before compiling it runs nvrm_bindings.py, which reads the NVRM installed on this machine and writes
-# nvrm_bindings.h: the driver's entry-point offsets, their first bytes (checked before every call) and the
-# OBJGPU field offsets. Build on the Mac that will load the kext; if the driver is updated, rebuild.
+# Before compiling it runs nvrm_bindings.py, which reads the NVRM binary (NVRM=, default the installed one) and
+# writes nvrm_bindings.h: the driver's LC_UUID, its entry-point offsets, their first bytes and the OBJGPU field
+# offsets. On this branch that table is committed: a git diff after a build shows when the driver changed, and the
+# kext binds to that one binary only. If the driver is rebuilt, rebuild this too and install both together.
 #
 # Needs VirtualSMC + Lilu sources for the plugin SDK headers. They are not in this repository; point
-# VSMCDIR/LILUDIR at them, or place them next to the repository as vsmc/VirtualSMC-master and
-# vsmc/Lilu-master (the layout of the workspace this was developed in).
+# VSMCDIR/LILUDIR at them (LILUDIR can be a Lilu.kext's Contents/Resources), or place them next to the repository
+# as vsmc/VirtualSMC-master and vsmc/Lilu-master. MACKERNELSDK= takes the kernel headers and kmod libraries from
+# acidanthera's MacKernelSDK instead of the macOS SDK.
 #
 #     kext/build.sh [output-directory]        (default: kext/build)
 #
@@ -18,6 +20,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 SDK=$(xcrun --show-sdk-path)
 KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
+KLIB=()
+if [ -n "${MACKERNELSDK:-}" ]; then
+    KHDR="$MACKERNELSDK/Headers"
+    KLIB=(-L"$MACKERNELSDK/Library/universal")
+fi
 VSMCDIR=${VSMCDIR:-$ROOT/../vsmc/VirtualSMC-master}
 LILUDIR=${LILUDIR:-$ROOT/../vsmc/Lilu-master/Lilu}
 OUT=${1:-$HERE/build}
@@ -35,13 +42,7 @@ NVRM=${NVRM:-/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM}
 [ -f "$NVRM" ] || { echo "STOP: $NVRM not found — install the NullMoth driver first (the offsets come from it)"; exit 1; }
 
 echo "== bindings"
-# Keep the constants of the driver that is installed right now, so the rebuilt kext still binds on it.
-if [ -f "$HERE/nvrm_bindings.h" ]; then
-    DRIVER_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' /Library/Extensions/NVRM.kext/Contents/Info.plist 2>/dev/null || echo unknown)
-    python3 "$HERE/bindings_legacy.py" --archive "$HERE/nvrm_bindings.h" "$HERE/bindings_archive" "$DRIVER_VERSION" | sed 's/^/   /' || true
-fi
-python3 "$HERE/nvrm_bindings.py" --binary "$NVRM" -o "$HERE/nvrm_bindings.h" | sed 's/^/   /'
-python3 "$HERE/bindings_legacy.py" --generate "$HERE/bindings_archive" "$HERE/nvrm_bindings_legacy.h" | sed 's/^/   /'
+python3 -I "$HERE/nvrm_bindings.py" --binary "$NVRM" -o "$HERE/nvrm_bindings.h" | sed 's/^/   /'
 
 KEXT="$OUT/SMCNvidiaGPU.kext"
 rm -rf "$KEXT"
@@ -55,7 +56,7 @@ xcrun clang++ -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$HERE" -
     -c "$HERE/SMCNvidiaGPU.cpp" -o "$OUT/smcngpu.o"
 
 echo "== link"
-xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext \
+xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext ${KLIB[@]+"${KLIB[@]}"} \
     -lkmodc++ -lkmod -lcc_kext \
     "$OUT/smcngpu.o" -o "$KEXT/Contents/MacOS/SMCNvidiaGPU"
 

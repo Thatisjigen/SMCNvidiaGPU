@@ -42,12 +42,12 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
+#include <mach-o/loader.h>
 
 #include <VirtualSMCSDK/kern_vsmcapi.hpp>
 #include <Headers/kern_util.hpp>
 
 #include "nvrm_bindings.h"
-#include "nvrm_bindings_legacy.h"
 
 #define SMCNVG_LOG(fmt, ...) do { IOLog("SMCNvidiaGPU: " fmt "\n", ##__VA_ARGS__); } while (0)
 
@@ -112,8 +112,7 @@ static char nvgpuvbios_override[64] = "";   /* user-supplied VBIOS version, used
 static int nvgpurombar = 0;                 /* raw PCI expansion ROM BAR value */
 static int nvgpurdrom = 0;                  /* diagnostics: 1 mapped, 2 signature ok, 4 version found, 8 map failed */
 static int nvgpulive = 0, nvgpulayout = 0, nvgpupoll = 0;
-static int nvgpuforced = 0;      /* set when the kext really bound without a signature match */
-static int nvgpufForceArg = 0;   /* nvsmcforce=1 boot argument */
+static int nvgpuforced = 0;      /* always 0 on this branch: nvsmcforce is gone, the sysctl stays for the app */
 
 /* RM-side sensors are read here now (see nvsmc_rm_* below); the daemon is no longer required. */
 
@@ -346,87 +345,62 @@ static bool sig_matches(UInt64 addr, const unsigned char *sig)
     return memcmp((const void *)(uintptr_t)addr, sig, NVRM_SIG_LEN) == 0;
 }
 
-/* Install one binding table if every entry point matches its recorded signature. */
-struct NvrmTable {
-    const char *label;
-    UInt64 anchorOff; const unsigned char *sigAnchor;
-    UInt64 gpuOff; const unsigned char *sigGpu;
-    UInt64 createOff; const unsigned char *sigCreate;
-    UInt64 linkOff; const unsigned char *sigLink;
-    UInt64 lockOff; const unsigned char *sigLock;
-    UInt64 unlockOff; const unsigned char *sigUnlock;
-    UInt64 pmInOff; const unsigned char *sigPmIn;
-    UInt64 pmOutOff; const unsigned char *sigPmOut;
-};
-
-static const NvrmTable kCurrentTable = {
-    NVRM_DRIVER_SHA256,
-    NVRM_ANCHOR_OFF, NVRM_SIG_anchor,
-    NVRM_OFF_gpumgrGetGpu, NVRM_SIG_gpumgrGetGpu,
-    NVRM_OFF_createRusd, NVRM_SIG_createRusd,
-    NVRM_OFF_linkRusd, NVRM_SIG_linkRusd,
-    NVRM_OFF_lock, NVRM_SIG_lock,
-    NVRM_OFF_unlock, NVRM_SIG_unlock,
-    NVRM_OFF_pmEnter, NVRM_SIG_pmEnter,
-    NVRM_OFF_pmExit, NVRM_SIG_pmExit,
-};
-
-static bool nvrm_apply_table(UInt64 anchor, const NvrmTable &t)
+/* The only build this kext binds to is the one its table was generated from. The first 16 bytes of eight
+ * functions do not say that: gpuCreateRusdMemory and gpuRusdInitPhysical start with the same 16 bytes here, and
+ * the OBJGPU field offsets are not checked by any signature at all. The Mach-O header of the running image still
+ * carries the file's LC_UUID (it is what kextstat prints, read by OSKext from this same header), and the kernel
+ * collection keeps it, so that is what decides. The walk stays inside the first page of the image. */
+#define NVRM_PAGE_MASK 0xfffull
+static bool nvrm_image_is_this_build(UInt64 base)
 {
-    const UInt64 base = anchor - t.anchorOff;
-    if (!sig_matches(anchor, t.sigAnchor))
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)(uintptr_t)base;
+    if (mh->magic != MH_MAGIC_64 || mh->filetype != MH_KEXT_BUNDLE)
         return false;
-    if (!sig_matches(base + t.gpuOff, t.sigGpu) ||
-        !sig_matches(base + t.createOff, t.sigCreate) ||
-        !sig_matches(base + t.linkOff, t.sigLink) ||
-        !sig_matches(base + t.lockOff, t.sigLock) ||
-        !sig_matches(base + t.unlockOff, t.sigUnlock) ||
-        !sig_matches(base + t.pmInOff, t.sigPmIn) ||
-        !sig_matches(base + t.pmOutOff, t.sigPmOut))
+    if (mh->ncmds == 0 || mh->ncmds > 64 || mh->sizeofcmds > NVRM_PAGE_MASK + 1 - sizeof(*mh))
         return false;
-
-    gApi.gpu = (void *(*)(unsigned int))(uintptr_t)(base + t.gpuOff);
-    gApi.createRusd = (int (*)(void *))(uintptr_t)(base + t.createOff);
-    gApi.linkRusd = (int (*)(void *))(uintptr_t)(base + t.linkOff);
-    gApi.lock = (int (*)(unsigned int, unsigned int))(uintptr_t)(base + t.lockOff);
-    gApi.unlock = (void (*)(void))(uintptr_t)(base + t.unlockOff);
-    gApi.pmEnter = (int (*)(void))(uintptr_t)(base + t.pmInOff);
-    gApi.pmExit = (void (*)(int))(uintptr_t)(base + t.pmOutOff);
-    gNvrmBase = base;
-    return true;
-}
-
-/* nvsmcforce=1 helper: the anchor is `83 3d <disp32> ...`, so a rebuild changes only the displacement.
- * Comparing everything but those four bytes still identifies which table belongs to this driver. */
-static bool sig_matches_anchor_relaxed(UInt64 addr, const unsigned char *sig)
-{
-    if (!addr)
-        return false;
-    const unsigned char *p = (const unsigned char *)(uintptr_t)addr;
-    for (unsigned i = 0; i < NVRM_SIG_LEN; i++) {
-        if (i >= 2 && i < 6)          /* rel32 of the RIP-relative compare */
-            continue;
-        if (p[i] != sig[i])
+    const UInt8 *p = (const UInt8 *)(mh + 1);
+    UInt32 left = mh->sizeofcmds;
+    for (UInt32 i = 0; i < mh->ncmds && left >= sizeof(struct load_command); i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmdsize < sizeof(struct load_command) || lc->cmdsize > left)
             return false;
+        if (lc->cmd == LC_UUID)
+            return lc->cmdsize >= sizeof(struct uuid_command) &&
+                   memcmp(((const struct uuid_command *)lc)->uuid, NVRM_UUID, NVRM_UUID_LEN) == 0;
+        p += lc->cmdsize;
+        left -= lc->cmdsize;
     }
-    return true;
+    return false;
 }
 
-/* nvsmcforce=1: install the table without checking the entry points. Only useful when the driver was
- * rebuilt with identical code layout but shifted bytes, and it can call into the wrong place otherwise —
- * that is why it is a boot argument and not something the kext decides on its own. */
-static void nvrm_apply_table_forced(UInt64 anchor, const NvrmTable &t)
+/* Install the binding table only for the exact build: anchor bytes, then a page-aligned image start, then the
+ * image's own UUID, and only then the other entry points. A different NVRM is turned away after reading the
+ * function it published (and, if those 16 bytes happen to be equal, its header), and nothing of it is called. */
+static bool nvrm_apply_table(UInt64 anchor)
 {
-    const UInt64 base = anchor - t.anchorOff;
-    gApi.gpu = (void *(*)(unsigned int))(uintptr_t)(base + t.gpuOff);
-    gApi.createRusd = (int (*)(void *))(uintptr_t)(base + t.createOff);
-    gApi.linkRusd = (int (*)(void *))(uintptr_t)(base + t.linkOff);
-    gApi.lock = (int (*)(unsigned int, unsigned int))(uintptr_t)(base + t.lockOff);
-    gApi.unlock = (void (*)(void))(uintptr_t)(base + t.unlockOff);
-    gApi.pmEnter = (int (*)(void))(uintptr_t)(base + t.pmInOff);
-    gApi.pmExit = (void (*)(int))(uintptr_t)(base + t.pmOutOff);
+    const UInt64 base = anchor - NVRM_ANCHOR_OFF;
+    if (!sig_matches(anchor, NVRM_SIG_anchor) || (base & NVRM_PAGE_MASK) != 0)
+        return false;
+    if (!nvrm_image_is_this_build(base))
+        return false;
+    if (!sig_matches(base + NVRM_OFF_gpumgrGetGpu, NVRM_SIG_gpumgrGetGpu) ||
+        !sig_matches(base + NVRM_OFF_createRusd, NVRM_SIG_createRusd) ||
+        !sig_matches(base + NVRM_OFF_linkRusd, NVRM_SIG_linkRusd) ||
+        !sig_matches(base + NVRM_OFF_lock, NVRM_SIG_lock) ||
+        !sig_matches(base + NVRM_OFF_unlock, NVRM_SIG_unlock) ||
+        !sig_matches(base + NVRM_OFF_pmEnter, NVRM_SIG_pmEnter) ||
+        !sig_matches(base + NVRM_OFF_pmExit, NVRM_SIG_pmExit))
+        return false;
+
+    gApi.gpu = (void *(*)(unsigned int))(uintptr_t)(base + NVRM_OFF_gpumgrGetGpu);
+    gApi.createRusd = (int (*)(void *))(uintptr_t)(base + NVRM_OFF_createRusd);
+    gApi.linkRusd = (int (*)(void *))(uintptr_t)(base + NVRM_OFF_linkRusd);
+    gApi.lock = (int (*)(unsigned int, unsigned int))(uintptr_t)(base + NVRM_OFF_lock);
+    gApi.unlock = (void (*)(void))(uintptr_t)(base + NVRM_OFF_unlock);
+    gApi.pmEnter = (int (*)(void))(uintptr_t)(base + NVRM_OFF_pmEnter);
+    gApi.pmExit = (void (*)(int))(uintptr_t)(base + NVRM_OFF_pmExit);
     gNvrmBase = base;
-    nvgpuforced = 1;
+    return true;
 }
 
 /* Find the driver: NVRMDisplay publishes "phys-for-va", the address of nv_xnu_phys_for_kernel_va. */
@@ -466,56 +440,14 @@ static bool nvrm_bind(void)
         return false;
     const UInt64 anchor = gNvrmAnchor;
 
-    if (nvrm_apply_table(anchor, kCurrentTable)) {
+    if (nvrm_apply_table(anchor)) {
         nvgpulayout = 1;
-        SMCNVG_LOG("bound NVRM %.12s at 0x%llx", NVRM_DRIVER_SHA256, (unsigned long long)gNvrmBase);
-        nvsens_state_set("bound NVRM 0x%llx", (unsigned long long)gNvrmBase);
+        SMCNVG_LOG("bound NVRM %.12s (uuid %s) at 0x%llx", NVRM_DRIVER_SHA256, NVRM_DRIVER_UUID, (unsigned long long)gNvrmBase);
+        nvsens_state_set("bound NVRM %.8s at 0x%llx", NVRM_DRIVER_SHA256, (unsigned long long)gNvrmBase);
         return true;
     }
-    for (int i = 0; i < kLegacyBindingCount; i++) {
-        const NvrmLegacyBinding &l = kLegacyBindings[i];
-        NvrmTable t = { l.label, l.anchorOff, l.sigAnchor, l.gpuOff, l.sigGpu, l.createOff, l.sigCreate,
-                        l.linkOff, l.sigLink, l.lockOff, l.sigLock, l.unlockOff, l.sigUnlock,
-                        l.pmInOff, l.sigPmIn, l.pmOutOff, l.sigPmOut };
-        if (nvrm_apply_table(anchor, t)) {
-            nvgpulayout = 1;
-            SMCNVG_LOG("bound NVRM %s at 0x%llx (legacy table)", l.label, (unsigned long long)gNvrmBase);
-            nvsens_state_set("bound NVRM %s 0x%llx", l.label, (unsigned long long)gNvrmBase);
-            return true;
-        }
-    }
-    if (nvgpufForceArg) {
-        /* Pick the table whose anchor still lines up apart from the displacement bytes, so the entry
-         * offsets come from the build that is actually installed; fall back to the current table. */
-        bool used = false;
-        if (sig_matches_anchor_relaxed(anchor, kCurrentTable.sigAnchor)) {
-            nvrm_apply_table_forced(anchor, kCurrentTable);
-            used = true;
-        }
-        for (int i = 0; !used && i < kLegacyBindingCount; i++) {
-            const NvrmLegacyBinding &l = kLegacyBindings[i];
-            NvrmTable t = { l.label, l.anchorOff, l.sigAnchor, l.gpuOff, l.sigGpu, l.createOff, l.sigCreate,
-                            l.linkOff, l.sigLink, l.lockOff, l.sigLock, l.unlockOff, l.sigUnlock,
-                            l.pmInOff, l.sigPmIn, l.pmOutOff, l.sigPmOut };
-            if (sig_matches_anchor_relaxed(anchor, l.sigAnchor)) {
-                nvrm_apply_table_forced(anchor, t);
-                nvsens_state_set("forced binding 0x%llx, table %s (nvsmcforce=1)",
-                                 (unsigned long long)gNvrmBase, l.label);
-                used = true;
-            }
-        }
-        if (!used) {
-            nvrm_apply_table_forced(anchor, kCurrentTable);
-            nvsens_state_set("forced binding 0x%llx, current table (nvsmcforce=1)",
-                             (unsigned long long)gNvrmBase);
-        }
-        nvgpulayout = 1;
-        SMCNVG_LOG("nvsmcforce: bound NVRM without checking the entry points at 0x%llx",
-                   (unsigned long long)gNvrmBase);
-        return true;
-    }
-    nvsens_state_set("NVRM at 0x%llx matches none of the %d known builds (nvsmcforce=1 to try anyway)",
-                     (unsigned long long)(anchor - kCurrentTable.anchorOff), kLegacyBindingCount + 1);
+    nvsens_state_set("NVRM with anchor 0x%llx is not build %.8s: rebuild this kext against it (kext/build.sh)",
+                     (unsigned long long)anchor, NVRM_DRIVER_SHA256);
     return false;
 }
 /* Run one RM operation with the GPU kept awake and the API lock held. */
@@ -1998,11 +1930,6 @@ void SMCNvidiaGPU::onTimer(OSObject *owner, IOTimerEventSource *src)
 bool SMCNvidiaGPU::start(IOService *provider)
 {
     int off = 0;
-    int forced = 0;
-    if (PE_parse_boot_argn("nvsmcforce", &forced, sizeof(forced)) && forced != 0) {
-        nvgpufForceArg = forced;
-        SMCNVG_LOG("nvsmcforce=%d boot argument: will bind even without a signature match", forced);
-    }
     if (PE_parse_boot_argn("nvsensoff", &off, sizeof(off)) && off != 0) {
         SMCNVG_LOG("nvsensoff=%d boot argument: staying out of the way", off);
         return false;

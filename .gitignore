@@ -16,8 +16,7 @@ nvgpud.new
 smcread
 nvstat/nvstat
 
-# ── kext 构建产物（build.sh 从本机 NVRM 反汇编生成这个头）──
-kext/nvrm_bindings.h
+# ── kext 构建产物 ──
 kext/build/
 
 # ── 历史探针二进制（nvstat/legacy 里只留源码）──

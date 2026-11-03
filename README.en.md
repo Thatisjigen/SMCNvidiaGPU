@@ -1,5 +1,23 @@
 # SMCNvidiaGPU
 
+> **Branch `acer/nvrm-acer`: one laptop, one driver build.** This branch of
+> [zzzyy678's SMCNvidiaGPU](https://github.com/zzzyy678/SMCNvidiaGPU) (MIT) targets an Acer Nitro ANV15-52 (RTX 5050 Laptop, GB20x)
+> running its owner's own build of the NullMoth 2.6.6 driver. It differs from upstream 1.6 in this:
+>
+> - `kext/nvrm_bindings.h` is committed and describes one binary (sha256 and `LC_UUID` in its first lines). The kext compares that
+>   UUID with the running image's Mach-O header and binds to nothing else; older tables and `nvsmcforce` are gone. `nvsensoff=1` stays.
+> - RM calls hold the GPU locks as well as the API lock.
+> - The kext does not map the GPU's expansion ROM, does not rename the GPU, and publishes nothing while unbound.
+> - RUSD temperatures are decoded as 24.8 fixed point, the P-state bit becomes its number, and the ECC offset is corrected.
+>
+> Other machines and other driver builds should use upstream. After a rebuild of the driver, rebuild this with the new binary and
+> install both together; until then the kext refuses the driver and `kern.nvgpustate` says so:
+>
+> ```bash
+> NVRM=/path/to/NVRM.kext/Contents/MacOS/NVRM VSMCDIR=/path/to/VirtualSMC LILUDIR=/path/to/Lilu.kext/Contents/Resources \
+>     MACKERNELSDK=/path/to/MacKernelSDK kext/build.sh out/release
+> ```
+
 A VirtualSMC sensor plugin for NVIDIA GPUs. On a Hackintosh it exposes temperature, power draw, per-fan
 RPM, clocks, VRAM and the PCIe link to iStat Menus and other monitoring tools.
 
