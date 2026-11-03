@@ -1519,6 +1519,15 @@ void SMCNvidiaGPU::readRusd()
     nvgpulive = (fChangedNs != 0 && now - fChangedNs < 3000000000ull) ? 1 : 0;
 }
 
+/* Off on this branch. Upstream maps and reads the GPU's expansion ROM here and rewrites the "model" of every "display"
+ * PCI node with " GeForce " in it; neither is a sensor, and binding is what would first run them on this laptop. Its ROM
+ * BAR is assigned (assigned-addresses: 0x58080000, 512 KB), while upstream's README says the ROM was not decoded on its
+ * RTX 5080, so reading it from a running GSP GPU is untested; and nothing else in the stack should see the GPU renamed.
+ * kern.nvgpuvbios_override still fills kern.nvgpuvbios. */
+#ifndef SMCNVG_TOUCH_DEVICE_NODES
+#define SMCNVG_TOUCH_DEVICE_NODES 0
+#endif
+#if SMCNVG_TOUCH_DEVICE_NODES
 /* Publish the VBIOS version the way AMD drivers do it: System Information's display reporter shows a
  * "ROM Revision" line when the display service (IOFramebuffer) or its provider carries a "rom-revision"
  * (or "ATY,Rom#") property. The version itself is not exposed by NVRM, so read it straight out of the GPU's
@@ -1690,6 +1699,7 @@ static void nvsmc_publish_rom_property()
     }
     s->release();
 }
+#endif /* SMCNVG_TOUCH_DEVICE_NODES */
 
 IOService *SMCNvidiaGPU::accel()
 {
@@ -1719,9 +1729,15 @@ void SMCNvidiaGPU::publish()
     /* Merge into what the accelerator already publishes: NVAccel's own PerformanceStatistics carries the
      * driver's VRAM numbers and other keys that consumers (AMD Power Gadget in particular) expect, and
      * replacing the dictionary outright drops them. */
+    /* copyProperty, not getProperty: the family and NVAccel replace this dictionary on their own timers (250 ms to
+     * 2 s), so an unretained pointer can be freed under us. withDictionary fails when the capacity is below the
+     * count, which would drop NVAccel's keys every time the merged dictionary passes that size. */
     OSDictionary *d = nullptr;
-    if (OSDictionary *cur = OSDynamicCast(OSDictionary, svc->getProperty("PerformanceStatistics")))
-        d = OSDictionary::withDictionary(cur, 32);
+    if (OSObject *prop = svc->copyProperty("PerformanceStatistics")) {
+        if (OSDictionary *cur = OSDynamicCast(OSDictionary, prop))
+            d = OSDictionary::withDictionary(cur, cur->getCount() + 16);
+        prop->release();
+    }
     if (!d)
         d = OSDictionary::withCapacity(24);
     if (!d)
@@ -1861,8 +1877,10 @@ void SMCNvidiaGPU::tick()
             }
             readRusd();
     if ((fTicks % 20) == 7) {
+#if SMCNVG_TOUCH_DEVICE_NODES
         if (fGpu)
             nvsmc_shorten_gpu_model();
+#endif
         if (nvgpupciewidth == 0)
             nvsmc_pci_link_from_registry();
     }
@@ -1893,6 +1911,7 @@ void SMCNvidiaGPU::tick()
     if (!fVbiosTried || (fTicks % 30) == 0) {
         fVbiosTried = true;
         if (!nvgpuvbios[0]) {
+#if SMCNVG_TOUCH_DEVICE_NODES
             if (nvgpuvbios_override[0])
                 nvsmc_strcpy(nvgpuvbios, nvgpuvbios_override, sizeof(nvgpuvbios));
             else
@@ -1900,9 +1919,16 @@ void SMCNvidiaGPU::tick()
             if (nvgpuvbios[0])
                 nvsmc_publish_rom_property();
     nvsmc_shorten_gpu_model();
+#else
+            if (nvgpuvbios_override[0])
+                nvsmc_strcpy(nvgpuvbios, nvgpuvbios_override, sizeof(nvgpuvbios));
+#endif
         }
     }
-            if (nvgpupoll && !nvgpulive && fTsPower == 0 && fRelinkTries < 20 && (fTicks % 20) == 0) {
+            /* Re-sending the address is a call into the GSP: only after 20 silent ticks since the poll request, not
+             * on the very tick of the request when it happens to be a multiple of 20. */
+            if (nvgpupoll && !nvgpulive && fTsPower == 0 && fRelinkTries < 20 && (fTicks % 20) == 0 &&
+                (fTicks - fLastPoll) >= 20) {
                 fRelinkTries++;
                 int status = nvsens_rm_call([this] { return gApi.linkRusd(fGpu); });
                 SMCNVG_LOG("re-published the RUSD address to the GSP (0x%x), try %u", status, fRelinkTries);
@@ -1912,8 +1938,10 @@ void SMCNvidiaGPU::tick()
         }
     }
 
-    /* sysctl-fed sensors are published even when the driver is not the build the bindings came from */
-    publish();
+    /* Only for the build the table came from. Unbound, every value here is 0: publishing them overwrites the real
+     * "Device Utilization %" NVAccel writes into the same dictionary, 0 and the real number taking turns. */
+    if (fBound)
+        publish();
 }
 
 void SMCNvidiaGPU::onTimer(OSObject *owner, IOTimerEventSource *src)
