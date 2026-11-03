@@ -40,6 +40,8 @@ SYMBOLS = [
     ("linkRusd", "_gpuRusdInitPhysical_KERNEL", "re-sends the RUSD address to the GSP"),
     ("lock", "_rmapiLockAcquire", "RM API lock, required around every RM call"),
     ("unlock", "_rmapiLockRelease", "RM API unlock"),
+    ("gpuLock", "_rmGpuLocksAcquire", "all GPU locks, after the API lock: the GSP RPC path expects both"),
+    ("gpuUnlock", "_rmGpuLocksRelease", "GPU locks, before the API lock"),
     ("pmEnter", "_nv_xnu_pm_enter", "NVRM's system-sleep gate"),
     ("pmExit", "_nv_xnu_pm_exit", ""),
 ]

@@ -300,6 +300,7 @@ SYSCTL_STRING(_kern, OID_AUTO, nvgpustate, CTLFLAG_RD, nvgpustate, sizeof(nvgpus
 
 #define RMSG_LOCK_WRITE 0x0u
 #define RMSG_MODULE_WORKITEM 0x100u   /* RM_LOCK_MODULE_VAL(0x000001, 0x00) */
+#define GPUS_LOCK_FLAGS_NONE 0x0u
 
 /* Fan percentage: RUSD reports RPM only, so the percentage iStat's GPU page wants is RPM over the card's
  * maximum, the way nvidia-smi defines it. RTX 5080-class coolers top out around 3 500 RPM; override with
@@ -315,6 +316,8 @@ struct NvrmApi {
     int (*linkRusd)(void *pGpu);
     int (*lock)(unsigned int flags, unsigned int module);
     void (*unlock)(void);
+    int (*gpuLock)(unsigned int flags, unsigned int module);
+    unsigned int (*gpuUnlock)(unsigned int flags, void *pDpcGpu);
     int (*pmEnter)(void);
     void (*pmExit)(int counted);
 };
@@ -345,8 +348,8 @@ static bool sig_matches(UInt64 addr, const unsigned char *sig)
     return memcmp((const void *)(uintptr_t)addr, sig, NVRM_SIG_LEN) == 0;
 }
 
-/* The only build this kext binds to is the one its table was generated from. The first 16 bytes of eight
- * functions do not say that: gpuCreateRusdMemory and gpuRusdInitPhysical start with the same 16 bytes here, and
+/* The only build this kext binds to is the one its table was generated from. The first 16 bytes of each entry
+ * point do not say that: gpuCreateRusdMemory and gpuRusdInitPhysical start with the same 16 bytes here, and
  * the OBJGPU field offsets are not checked by any signature at all. The Mach-O header of the running image still
  * carries the file's LC_UUID (it is what kextstat prints, read by OSKext from this same header), and the kernel
  * collection keeps it, so that is what decides. The walk stays inside the first page of the image. */
@@ -388,6 +391,8 @@ static bool nvrm_apply_table(UInt64 anchor)
         !sig_matches(base + NVRM_OFF_linkRusd, NVRM_SIG_linkRusd) ||
         !sig_matches(base + NVRM_OFF_lock, NVRM_SIG_lock) ||
         !sig_matches(base + NVRM_OFF_unlock, NVRM_SIG_unlock) ||
+        !sig_matches(base + NVRM_OFF_gpuLock, NVRM_SIG_gpuLock) ||
+        !sig_matches(base + NVRM_OFF_gpuUnlock, NVRM_SIG_gpuUnlock) ||
         !sig_matches(base + NVRM_OFF_pmEnter, NVRM_SIG_pmEnter) ||
         !sig_matches(base + NVRM_OFF_pmExit, NVRM_SIG_pmExit))
         return false;
@@ -397,6 +402,8 @@ static bool nvrm_apply_table(UInt64 anchor)
     gApi.linkRusd = (int (*)(void *))(uintptr_t)(base + NVRM_OFF_linkRusd);
     gApi.lock = (int (*)(unsigned int, unsigned int))(uintptr_t)(base + NVRM_OFF_lock);
     gApi.unlock = (void (*)(void))(uintptr_t)(base + NVRM_OFF_unlock);
+    gApi.gpuLock = (int (*)(unsigned int, unsigned int))(uintptr_t)(base + NVRM_OFF_gpuLock);
+    gApi.gpuUnlock = (unsigned int (*)(unsigned int, void *))(uintptr_t)(base + NVRM_OFF_gpuUnlock);
     gApi.pmEnter = (int (*)(void))(uintptr_t)(base + NVRM_OFF_pmEnter);
     gApi.pmExit = (void (*)(int))(uintptr_t)(base + NVRM_OFF_pmExit);
     gNvrmBase = base;
@@ -450,20 +457,23 @@ static bool nvrm_bind(void)
                      (unsigned long long)anchor, NVRM_DRIVER_SHA256);
     return false;
 }
-/* Run one RM operation with the GPU kept awake and the API lock held. */
+/* Run one RM operation with the GPU kept awake and the API and GPU locks held, in RM's order. Without the GPU locks
+ * rpcRmApiControl_GSP takes them itself, but only after logging "without adequate locks" and an assert ("RPC locking
+ * violation") on every call, a few lines a second for as long as the kext runs. */
 template <typename Body>
 static int nvsens_rm_call(Body body)
 {
-    if (!gApi.lock || !gApi.pmEnter || !gApi.pmExit)
+    if (!gApi.lock || !gApi.gpuLock || !gApi.pmEnter || !gApi.pmExit)
         return -1;
     int counted = gApi.pmEnter();
-    int lockStatus = gApi.lock(RMSG_LOCK_WRITE, RMSG_MODULE_WORKITEM);
-    int status;
-    if (lockStatus == 0) {
-        status = body();
+    int status = gApi.lock(RMSG_LOCK_WRITE, RMSG_MODULE_WORKITEM);
+    if (status == 0) {
+        status = gApi.gpuLock(GPUS_LOCK_FLAGS_NONE, RMSG_MODULE_WORKITEM);
+        if (status == 0) {
+            status = body();
+            gApi.gpuUnlock(GPUS_LOCK_FLAGS_NONE, nullptr);
+        }
         gApi.unlock();
-    } else {
-        status = lockStatus;
     }
     gApi.pmExit(counted);
     return status;
