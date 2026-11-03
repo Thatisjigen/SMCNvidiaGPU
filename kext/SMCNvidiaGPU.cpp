@@ -278,7 +278,7 @@ SYSCTL_STRING(_kern, OID_AUTO, nvgpustate, CTLFLAG_RD, nvgpustate, sizeof(nvgpus
 #define RUSD_OFF_AVG_POWER 0x09a8u
 #define RUSD_OFF_POWER_POLICY 0x09d8u
 #define RUSD_OFF_CLK_THROTTLE 0x0070u   /* ts + u32 reasonMask ... */
-#define RUSD_OFF_MEM_ECC 0x0878u
+#define RUSD_OFF_MEM_ECC 0x07f8u     /* offsetof(NV00DE_SHARED_DATA, memEcc), 615.78.08; 0x0878 is inside that section */
 #define RUSD_OFF_INST_POWER 0x09c0u
 #define RUSD_OFF_PCI_BUS_DATA 0x09e8u
 #define RUSD_OFF_FAN 0x0a18u
@@ -486,6 +486,7 @@ static void nvsmc_read_pcie_bus(void *pGpu)
         return;
     struct BusInfo { UInt32 index, data; };
     struct { UInt32 count; BusInfo list[52]; } params;
+    static_assert(sizeof(params) == 420, "NV2080_CTRL_BUS_GET_INFO_V2_PARAMS");
     memset(&params, 0, sizeof params);
     params.count = 2;
     params.list[0].index = 0x03u;   /* PCIE_GPU_LINK_CAPS */
@@ -907,6 +908,7 @@ bool SMCNvidiaGPU::requestPoll()
         UInt32 pollIntervalMs;
         UInt32 pad;
     } params = { RUSD_POLL_MASK, RUSD_POLL_INTERVAL_MS, 0 };
+    static_assert(sizeof(params) == 16, "NV2080_CTRL_INTERNAL_USER_SHARED_DATA_SET_DATA_POLL_PARAMS");
     const UInt64 kFallbackMask = 0x5bull;   /* CLOCK|PERF|POWER|THERMAL|FAN: what older firmware accepted */
 
     typedef int (*rm_control_t)(void *pRmApi, UInt32 hClient, UInt32 hObject, UInt32 cmd, void *pParams, UInt32 size);
@@ -956,6 +958,11 @@ struct ClkParams { PmuSuper super; ClkSample samples[250]; };
 struct UtilEngine { UInt32 util, vgpuScale, procId, subProcessID; char name[100]; UInt64 pOsPidInfo; };
 struct UtilSample { UInt64 ts; UtilEngine fb, gr, nvenc, nvdec, nvjpg, nvofa; };
 struct UtilParams { UInt8 type; UInt32 bufSize, count, tracker; UtilSample samples[72]; };
+
+/* The sizes RM's own headers give (615.78.08): these go to the GSP as paramsSize. */
+static_assert(sizeof(ThermParams) == 1432, "NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_V2_PARAMS");
+static_assert(sizeof(ClkParams) == 6024, "NV2080_CTRL_CLK_PMUMON_CLK_DOMAINS_GET_SAMPLES_PARAMS");
+static_assert(sizeof(UtilParams) == 55888, "NV2080_CTRL_PERF_GET_GPUMON_PERFMON_UTIL_SAMPLES_V2_PARAMS");
 
 static ClkParams gClkParams;
 static UtilParams gUtilParams;
@@ -1027,6 +1034,7 @@ typedef struct {
     NvThermalInstruction instructionList[32];
 } NvThermalExecuteParams;
 
+static_assert(sizeof(NvThermalExecuteParams) == 1432, "NV2080_CTRL_THERMAL_SYSTEM_EXECUTE_V2_PARAMS");
 static bool nvsmc_thermal_execute(void *pGpu, NvThermalExecuteParams *p, int *statusOut)
 {
     return nvsmc_rm_call_gpu(pGpu, NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2, p, sizeof *p, statusOut);
@@ -1203,10 +1211,11 @@ static bool nvsmc_rm_clocks(void *pGpu)
         return false;
     if (n > 250) n = 250;
     const ClkSample &x = gClkParams.samples[n - 1];
-    nvggpcclk = (int)(x.gpcKHz / 1000);
-    nvgdramclk = (int)(x.dramKHz / 1000);
-    nvgnvdclk = (int)(x.nvdKHz / 1000);
-    nvgactivegpc = (int)(x.activeGpcKHz / 1000);
+    /* NV2080_CTRL_CLK_PMUMON_CLK_DOMAINS_SAMPLE_INVALID (all ones) means not supported on this GPU, not 4.3 THz */
+    nvggpcclk = x.gpcKHz == 0xffffffffu ? 0 : (int)(x.gpcKHz / 1000);
+    nvgdramclk = x.dramKHz == 0xffffffffu ? 0 : (int)(x.dramKHz / 1000);
+    nvgnvdclk = x.nvdKHz == 0xffffffffu ? 0 : (int)(x.nvdKHz / 1000);
+    nvgactivegpc = x.activeGpcKHz == 0xffffffffu ? 0 : (int)(x.activeGpcKHz / 1000);
     return true;
 }
 
@@ -1340,8 +1349,14 @@ static bool nvsmc_rm_pstate(void *pGpu)
     UInt32 ps = 0;
     if (!nvsmc_rm_call_gpu(pGpu, 0x20802068u, &ps, sizeof ps, nullptr))
         return false;
-    nvgpstate = (int)ps;
-    return true;
+    /* NV2080_CTRL_PERF_PSTATES_Px is one bit per state: P4 is 0x10, which the app would print as P16. */
+    for (int i = 0; i < 16; i++) {
+        if (ps == (1u << i)) {
+            nvgpstate = i;
+            return true;
+        }
+    }
+    return false;
 }
 
 static inline bool nvsens_ts_valid(UInt64 ts)
@@ -1451,7 +1466,10 @@ void SMCNvidiaGPU::readRusd()
         if (!nvsens_read_polled(b, RUSD_OFF_TEMPERATURES + (UInt32)i * RUSD_TEMP_STRIDE, &temp, sizeof(temp), &temp.ts))
             continue;
         if (i == 0 && temp.ts != fTsTemp) { fTsTemp = temp.ts; anyNew = true; }
-        if (temp.temp > 0 && temp.temp < 150) nvgpurusdtemps[i] = (int)temp.temp;
+        /* NvTemp is signed 24.8 fixed point (nvfixedtypes.h): on the RTX 5050 the page holds 13424 for 52.4 C, which
+         * the old check for 0..150 dropped, so every RUSD sensor read 0. */
+        int celsius = (int)temp.temp / 256;
+        if (celsius > 0 && celsius < 150) nvgpurusdtemps[i] = celsius;
     }
     nvgpurusdtemp = nvgpurusdtemps[0];
 
