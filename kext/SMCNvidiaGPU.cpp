@@ -20,11 +20,9 @@
  *
  * The RUSD half therefore runs here, in the kernel. The kext is injected by OpenCore, i.e. it loads from the
  * boot kernel collection *before* the NullMoth driver (auxiliary collection), so it cannot link against
- * com.nullmoth.NVRM. Instead it finds the driver at run time: NVRM publishes the address of its own
- * nv_xnu_phys_for_kernel_va as "phys-for-va" on the NVRMDisplay nub, which gives the load address (KASLR
- * included); every other entry point is that base plus the offset recovered from the installed driver by
- * kext/nvrm_bindings.py, and each one is checked byte for byte against the build-time signature before it is
- * called. A driver that does not match is simply left alone.
+ * com.nullmoth.NVRM. Instead it asks the driver at run time: NVRM answers callPlatformFunction("NVRMSmcApi") with
+ * its entry points and OBJGPU field offsets, which its own compiler filled in, so nothing here depends on one
+ * build of NVRM. A driver without that call is left alone and the sensors stay at zero.
  *
  * With the entry points in hand it does what the driver would do:
  *   gpuCreateRusdMemory(OBJGPU *)  allocate + map the RUSD block, hand it to the GSP, set up polling
@@ -42,12 +40,11 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
-#include <mach-o/loader.h>
 
 #include <VirtualSMCSDK/kern_vsmcapi.hpp>
 #include <Headers/kern_util.hpp>
 
-#include "nvrm_bindings.h"
+#include "nvrm_smc_abi.h"
 
 #define SMCNVG_LOG(fmt, ...) do { IOLog("SMCNvidiaGPU: " fmt "\n", ##__VA_ARGS__); } while (0)
 
@@ -244,7 +241,7 @@ SYSCTL_STRING(_kern, OID_AUTO, nvgpuvbios_override, CTLFLAG_RW, nvgpuvbios_overr
 SYSCTL_INT(_kern, OID_AUTO, nvgpurombar, CTLFLAG_RD, &nvgpurombar, 0, "PCI expansion ROM BAR value");
 SYSCTL_INT(_kern, OID_AUTO, nvgpurdrom, CTLFLAG_RD, &nvgpurdrom, 0, "ROM read diagnostics bits");
 SYSCTL_INT(_kern, OID_AUTO, nvgpulive, CTLFLAG_RD, &nvgpulive, 0, "NVIDIA RUSD data updated recently");
-SYSCTL_INT(_kern, OID_AUTO, nvgpulayout, CTLFLAG_RD, &nvgpulayout, 0, "NVRM matched nvrm_bindings.h");
+SYSCTL_INT(_kern, OID_AUTO, nvgpulayout, CTLFLAG_RD, &nvgpulayout, 0, "bound to NVRM's interface");
 SYSCTL_INT(_kern, OID_AUTO, nvgpupoll, CTLFLAG_RD, &nvgpupoll, 0, "GSP accepted the RUSD poll request");
 SYSCTL_STRING(_kern, OID_AUTO, nvgpustate, CTLFLAG_RD, nvgpustate, sizeof(nvgpustate), "SMCNvidiaGPU last state");
 
@@ -322,8 +319,10 @@ struct NvrmApi {
     void (*pmExit)(int counted);
 };
 static NvrmApi gApi;
-static UInt64 gNvrmBase = 0;
-static UInt64 gNvrmAnchor = 0;
+static bool gNvrmBound = false;
+/* Byte offsets in OBJGPU, from NVRM: nvrm_bind */
+static UInt32 OFF_HINTERNAL_CLIENT, OFF_HINTERNAL_SUBDEVICE, OFF_PHYSICAL_RMAPI, OFF_RMAPI_CONTROL;
+static UInt32 OFF_USD_PMEMDESC, OFF_USD_PMAPBUFFER, OFF_USD_DATA;
 
 static inline UInt64 nvsens_now_ns(void)
 {
@@ -341,121 +340,46 @@ static void nvsens_state_set(const char *fmt, ...)
     va_end(ap);
 }
 
-static bool sig_matches(UInt64 addr, const unsigned char *sig)
+/* NVRM says what it has, from its own compiler, on every build. An NVRM without the call is left alone. */
+static bool nvrm_bind(IOService *nvrm)
 {
-    if (!addr)
-        return false;
-    return memcmp((const void *)(uintptr_t)addr, sig, NVRM_SIG_LEN) == 0;
-}
-
-/* The only build this kext binds to is the one its table was generated from. The first 16 bytes of each entry
- * point do not say that: gpuCreateRusdMemory and gpuRusdInitPhysical start with the same 16 bytes here, and
- * the OBJGPU field offsets are not checked by any signature at all. The Mach-O header of the running image still
- * carries the file's LC_UUID (it is what kextstat prints, read by OSKext from this same header), and the kernel
- * collection keeps it, so that is what decides. The walk stays inside the first page of the image. */
-#define NVRM_PAGE_MASK 0xfffull
-static bool nvrm_image_is_this_build(UInt64 base)
-{
-    const struct mach_header_64 *mh = (const struct mach_header_64 *)(uintptr_t)base;
-    if (mh->magic != MH_MAGIC_64 || mh->filetype != MH_KEXT_BUNDLE)
-        return false;
-    if (mh->ncmds == 0 || mh->ncmds > 64 || mh->sizeofcmds > NVRM_PAGE_MASK + 1 - sizeof(*mh))
-        return false;
-    const UInt8 *p = (const UInt8 *)(mh + 1);
-    UInt32 left = mh->sizeofcmds;
-    for (UInt32 i = 0; i < mh->ncmds && left >= sizeof(struct load_command); i++) {
-        const struct load_command *lc = (const struct load_command *)p;
-        if (lc->cmdsize < sizeof(struct load_command) || lc->cmdsize > left)
-            return false;
-        if (lc->cmd == LC_UUID)
-            return lc->cmdsize >= sizeof(struct uuid_command) &&
-                   memcmp(((const struct uuid_command *)lc)->uuid, NVRM_UUID, NVRM_UUID_LEN) == 0;
-        p += lc->cmdsize;
-        left -= lc->cmdsize;
-    }
-    return false;
-}
-
-/* Install the binding table only for the exact build: anchor bytes, then a page-aligned image start, then the
- * image's own UUID, and only then the other entry points. A different NVRM is turned away after reading the
- * function it published (and, if those 16 bytes happen to be equal, its header), and nothing of it is called. */
-static bool nvrm_apply_table(UInt64 anchor)
-{
-    const UInt64 base = anchor - NVRM_ANCHOR_OFF;
-    if (!sig_matches(anchor, NVRM_SIG_anchor) || (base & NVRM_PAGE_MASK) != 0)
-        return false;
-    if (!nvrm_image_is_this_build(base))
-        return false;
-    if (!sig_matches(base + NVRM_OFF_gpumgrGetGpu, NVRM_SIG_gpumgrGetGpu) ||
-        !sig_matches(base + NVRM_OFF_createRusd, NVRM_SIG_createRusd) ||
-        !sig_matches(base + NVRM_OFF_linkRusd, NVRM_SIG_linkRusd) ||
-        !sig_matches(base + NVRM_OFF_lock, NVRM_SIG_lock) ||
-        !sig_matches(base + NVRM_OFF_unlock, NVRM_SIG_unlock) ||
-        !sig_matches(base + NVRM_OFF_gpuLock, NVRM_SIG_gpuLock) ||
-        !sig_matches(base + NVRM_OFF_gpuUnlock, NVRM_SIG_gpuUnlock) ||
-        !sig_matches(base + NVRM_OFF_pmEnter, NVRM_SIG_pmEnter) ||
-        !sig_matches(base + NVRM_OFF_pmExit, NVRM_SIG_pmExit))
-        return false;
-
-    gApi.gpu = (void *(*)(unsigned int))(uintptr_t)(base + NVRM_OFF_gpumgrGetGpu);
-    gApi.createRusd = (int (*)(void *))(uintptr_t)(base + NVRM_OFF_createRusd);
-    gApi.linkRusd = (int (*)(void *))(uintptr_t)(base + NVRM_OFF_linkRusd);
-    gApi.lock = (int (*)(unsigned int, unsigned int))(uintptr_t)(base + NVRM_OFF_lock);
-    gApi.unlock = (void (*)(void))(uintptr_t)(base + NVRM_OFF_unlock);
-    gApi.gpuLock = (int (*)(unsigned int, unsigned int))(uintptr_t)(base + NVRM_OFF_gpuLock);
-    gApi.gpuUnlock = (unsigned int (*)(unsigned int, void *))(uintptr_t)(base + NVRM_OFF_gpuUnlock);
-    gApi.pmEnter = (int (*)(void))(uintptr_t)(base + NVRM_OFF_pmEnter);
-    gApi.pmExit = (void (*)(int))(uintptr_t)(base + NVRM_OFF_pmExit);
-    gNvrmBase = base;
-    return true;
-}
-
-/* Find the driver: NVRMDisplay publishes "phys-for-va", the address of nv_xnu_phys_for_kernel_va. */
-static bool nvrm_base_from_display_nub(void)
-{
-    if (gNvrmBase)
+    if (gNvrmBound)
         return true;
-    OSDictionary *m = IOService::serviceMatching("NVRMDisplay");
-    if (!m)
+    if (!nvrm)
         return false;
-    OSIterator *it = IOService::getMatchingServices(m);
-    m->release();
-    if (!it)
+    const OSSymbol *fn = OSSymbol::withCString(NVRM_SMC_API_FN);
+    if (!fn)
         return false;
-    UInt64 anchor = 0;
-    while (IOService *nub = OSDynamicCast(IOService, it->getNextObject())) {
-        OSNumber *n = OSDynamicCast(OSNumber, nub->getProperty("phys-for-va"));
-        if (!n)
-            continue;
-        UInt64 v = n->unsigned64BitValue();
-        if (v > 0xffffff0000000000ull) {      /* must be a kernel text address */
-            anchor = v;
-            break;
-        }
+    NVRMSmcApi api = {};
+    api.version = NVRM_SMC_API_VERSION;
+    const IOReturn r = nvrm->callPlatformFunction(fn, false, &api, nullptr, nullptr, nullptr);
+    fn->release();
+    if (r != kIOReturnSuccess || api.size != sizeof(api) || !api.gpumgrGetGpu || !api.createRusd || !api.linkRusd ||
+        !api.lock || !api.unlock || !api.gpuLock || !api.gpuUnlock || !api.pmEnter || !api.pmExit) {
+        nvsens_state_set("this NVRM has no sensor interface (0x%x): build it from the same fork", r);
+        return false;
     }
-    it->release();
-    if (!anchor)
-        return false;
-    gNvrmAnchor = anchor;
-    (void)gNvrmAnchor;
+    gApi.gpu = (void *(*)(unsigned int))api.gpumgrGetGpu;
+    gApi.createRusd = (int (*)(void *))api.createRusd;
+    gApi.linkRusd = (int (*)(void *))api.linkRusd;
+    gApi.lock = (int (*)(unsigned int, unsigned int))api.lock;
+    gApi.unlock = (void (*)(void))api.unlock;
+    gApi.gpuLock = (int (*)(unsigned int, unsigned int))api.gpuLock;
+    gApi.gpuUnlock = (unsigned int (*)(unsigned int, void *))api.gpuUnlock;
+    gApi.pmEnter = (int (*)(void))api.pmEnter;
+    gApi.pmExit = (void (*)(int))api.pmExit;
+    OFF_HINTERNAL_CLIENT = api.hInternalClient;
+    OFF_HINTERNAL_SUBDEVICE = api.hInternalSubdevice;
+    OFF_PHYSICAL_RMAPI = api.physicalRmApi;
+    OFF_RMAPI_CONTROL = api.rmapiControl;
+    OFF_USD_PMEMDESC = api.usdMemDesc;
+    OFF_USD_PMAPBUFFER = api.usdMapBuffer;
+    OFF_USD_DATA = api.usdData;
+    gNvrmBound = true;
+    nvgpulayout = 1;
+    SMCNVG_LOG("bound NVRM through its interface, version %u", api.version);
+    nvsens_state_set("bound NVRM through its interface");
     return true;
-}
-
-static bool nvrm_bind(void)
-{
-    if (!nvrm_base_from_display_nub())
-        return false;
-    const UInt64 anchor = gNvrmAnchor;
-
-    if (nvrm_apply_table(anchor)) {
-        nvgpulayout = 1;
-        SMCNVG_LOG("bound NVRM %.12s (uuid %s) at 0x%llx", NVRM_DRIVER_SHA256, NVRM_DRIVER_UUID, (unsigned long long)gNvrmBase);
-        nvsens_state_set("bound NVRM %.8s at 0x%llx", NVRM_DRIVER_SHA256, (unsigned long long)gNvrmBase);
-        return true;
-    }
-    nvsens_state_set("NVRM with anchor 0x%llx is not build %.8s: rebuild this kext against it (kext/build.sh)",
-                     (unsigned long long)anchor, NVRM_DRIVER_SHA256);
-    return false;
 }
 /* Run one RM operation with the GPU kept awake and the API and GPU locks held, in RM's order. Without the GPU locks
  * rpcRmApiControl_GSP takes them itself, but only after logging "without adequate locks" and an assert ("RPC locking
@@ -1884,7 +1808,7 @@ bool SMCNvidiaGPU::vsmcNotificationHandler(void *self, void *refCon, IOService *
 
 void SMCNvidiaGPU::tick()
 {
-    if (!fBound && nvrm_bind())
+    if (!fBound && driverReady() && nvrm_bind(fNvrm))
         fBound = true;
 
     if (fBound) {
@@ -1999,7 +1923,6 @@ bool SMCNvidiaGPU::start(IOService *provider)
 
     registerSysctls();
     setProperty("SMCNvidiaGPUAlive", kOSBooleanTrue);
-    setProperty("NVRMDriverSHA256", NVRM_DRIVER_SHA256);
     nvsens_state_set("started, waiting for NVRM");
 
     VirtualSMCAPI::addKey(SMC_MAKE_IDENTIFIER('T','G','0','D'), vsmcPlugin.data, VirtualSMCAPI::valueWithSp(0, SmcKeyTypeSp78, new GPUTempValue()));

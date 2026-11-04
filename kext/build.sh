@@ -1,10 +1,7 @@
 #!/bin/bash
 # build.sh — build SMCNvidiaGPU.kext (VirtualSMC plugin, OpenCore-injected) without Xcode or a KDK.
 #
-# Before compiling it runs nvrm_bindings.py, which reads the NVRM binary (NVRM=, default the installed one) and
-# writes nvrm_bindings.h: the driver's LC_UUID, its entry-point offsets, their first bytes and the OBJGPU field
-# offsets. On this branch that table is committed: a git diff after a build shows when the driver changed, and the
-# kext binds to that one binary only. If the driver is rebuilt, rebuild this too and install both together.
+# It needs nothing from the NVRM binary: the kext asks NVRM for its entry points and offsets at run time.
 #
 # Needs VirtualSMC + Lilu sources for the plugin SDK headers. They are not in this repository; point
 # VSMCDIR/LILUDIR at them (LILUDIR can be a Lilu.kext's Contents/Resources), or place them next to the repository
@@ -34,15 +31,11 @@ case "$MODE" in
     debug)   OPT_FLAGS="-O0 -g" ; DEBUG_DEFINE="-DSMCNVG_DEBUG=1" ; FLAVOR="debug" ;;
     *) echo "STOP: MODE must be release or debug"; exit 2 ;;
 esac
-NVRM=${NVRM:-/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM}
 
 [ -d "$KHDR" ] || { echo "STOP: no kernel headers in $SDK"; exit 1; }
 [ -d "$VSMCDIR/VirtualSMCSDK" ] || { echo "STOP: VirtualSMC SDK not found at $VSMCDIR (set VSMCDIR)"; exit 1; }
 [ -d "$LILUDIR/Headers" ] || { echo "STOP: Lilu headers not found at $LILUDIR (set LILUDIR)"; exit 1; }
-[ -f "$NVRM" ] || { echo "STOP: $NVRM not found — install the NullMoth driver first (the offsets come from it)"; exit 1; }
 
-echo "== bindings"
-python3 -I "$HERE/nvrm_bindings.py" --binary "$NVRM" -o "$HERE/nvrm_bindings.h" | sed 's/^/   /'
 
 KEXT="$OUT/SMCNvidiaGPU.kext"
 rm -rf "$KEXT"
