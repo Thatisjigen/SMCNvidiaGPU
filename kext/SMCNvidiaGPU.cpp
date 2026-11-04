@@ -723,6 +723,8 @@ void SMCNvidiaGPU::registerSysctls()
     sysctl_register_oid(&sysctl__kern_nvgpulayout);
     sysctl_register_oid(&sysctl__kern_nvgpupoll);
     sysctl_register_oid(&sysctl__kern_nvgpustate);
+    sysctl_register_oid(&sysctl__kern_nvgpumodel);
+    sysctl_register_oid(&sysctl__kern_nvgpuforced);
     sysctl_register_oid(&sysctl__kern_nvgpufanmax);
     fSysctls = true;
 }
@@ -834,6 +836,8 @@ void SMCNvidiaGPU::unregisterSysctls()
     sysctl_unregister_oid(&sysctl__kern_nvgpulayout);
     sysctl_unregister_oid(&sysctl__kern_nvgpupoll);
     sysctl_unregister_oid(&sysctl__kern_nvgpustate);
+    sysctl_unregister_oid(&sysctl__kern_nvgpumodel);
+    sysctl_unregister_oid(&sysctl__kern_nvgpuforced);
     sysctl_unregister_oid(&sysctl__kern_nvgpufanmax);
     fSysctls = false;
 }
