@@ -139,20 +139,20 @@ static int nvgpusysctl_rusddump SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, nvgpurusddump, CTLTYPE_STRING | CTLFLAG_RD, 0, 0,
             nvgpusysctl_rusddump, "A", "hex dump of the NV00DE_SHARED_DATA block");
 
-SYSCTL_INT(_kern, OID_AUTO, nvgputemp, CTLFLAG_RW, &nvgputemp, 0, "NVIDIA GPU temperature C");
-SYSCTL_INT(_kern, OID_AUTO, nvggpcclk, CTLFLAG_RW, &nvggpcclk, 0, "NVIDIA GPU core clock MHz");
-SYSCTL_INT(_kern, OID_AUTO, nvgdramclk, CTLFLAG_RW, &nvgdramclk, 0, "NVIDIA GPU memory clock MHz");
-SYSCTL_INT(_kern, OID_AUTO, nvgnvdclk, CTLFLAG_RW, &nvgnvdclk, 0, "NVIDIA GPU NVD clock MHz");
-SYSCTL_INT(_kern, OID_AUTO, nvgactivegpc, CTLFLAG_RW, &nvgactivegpc, 0, "NVIDIA GPU active GPC clock MHz");
-SYSCTL_INT(_kern, OID_AUTO, nvgutil, CTLFLAG_RW, &nvgutil, 0, "NVIDIA GPU utilization pct*100");
-SYSCTL_INT(_kern, OID_AUTO, nvgutilfb, CTLFLAG_RW, &nvgutilfb, 0, "NVIDIA GPU FB utilization pct*100");
-SYSCTL_INT(_kern, OID_AUTO, nvgutilenc, CTLFLAG_RW, &nvgutilenc, 0, "NVIDIA GPU encoder utilization pct*100");
-SYSCTL_INT(_kern, OID_AUTO, nvgutildec, CTLFLAG_RW, &nvgutildec, 0, "NVIDIA GPU decoder utilization pct*100");
-SYSCTL_INT(_kern, OID_AUTO, nvgutiljpg, CTLFLAG_RW, &nvgutiljpg, 0, "NVIDIA GPU JPEG utilization pct*100");
-SYSCTL_INT(_kern, OID_AUTO, nvgutilofa, CTLFLAG_RW, &nvgutilofa, 0, "NVIDIA GPU OFA utilization pct*100");
-SYSCTL_INT(_kern, OID_AUTO, nvgvramtotal, CTLFLAG_RW, &nvgvramtotal, 0, "NVIDIA GPU VRAM total MB");
-SYSCTL_INT(_kern, OID_AUTO, nvgvramused, CTLFLAG_RW, &nvgvramused, 0, "NVIDIA GPU VRAM used MB");
-SYSCTL_INT(_kern, OID_AUTO, nvgpstate, CTLFLAG_RW, &nvgpstate, 0, "NVIDIA GPU current P-state");
+SYSCTL_INT(_kern, OID_AUTO, nvgputemp, CTLFLAG_RD, &nvgputemp, 0, "NVIDIA GPU temperature C");
+SYSCTL_INT(_kern, OID_AUTO, nvggpcclk, CTLFLAG_RD, &nvggpcclk, 0, "NVIDIA GPU core clock MHz");
+SYSCTL_INT(_kern, OID_AUTO, nvgdramclk, CTLFLAG_RD, &nvgdramclk, 0, "NVIDIA GPU memory clock MHz");
+SYSCTL_INT(_kern, OID_AUTO, nvgnvdclk, CTLFLAG_RD, &nvgnvdclk, 0, "NVIDIA GPU NVD clock MHz");
+SYSCTL_INT(_kern, OID_AUTO, nvgactivegpc, CTLFLAG_RD, &nvgactivegpc, 0, "NVIDIA GPU active GPC clock MHz");
+SYSCTL_INT(_kern, OID_AUTO, nvgutil, CTLFLAG_RD, &nvgutil, 0, "NVIDIA GPU utilization pct*100");
+SYSCTL_INT(_kern, OID_AUTO, nvgutilfb, CTLFLAG_RD, &nvgutilfb, 0, "NVIDIA GPU FB utilization pct*100");
+SYSCTL_INT(_kern, OID_AUTO, nvgutilenc, CTLFLAG_RD, &nvgutilenc, 0, "NVIDIA GPU encoder utilization pct*100");
+SYSCTL_INT(_kern, OID_AUTO, nvgutildec, CTLFLAG_RD, &nvgutildec, 0, "NVIDIA GPU decoder utilization pct*100");
+SYSCTL_INT(_kern, OID_AUTO, nvgutiljpg, CTLFLAG_RD, &nvgutiljpg, 0, "NVIDIA GPU JPEG utilization pct*100");
+SYSCTL_INT(_kern, OID_AUTO, nvgutilofa, CTLFLAG_RD, &nvgutilofa, 0, "NVIDIA GPU OFA utilization pct*100");
+SYSCTL_INT(_kern, OID_AUTO, nvgvramtotal, CTLFLAG_RD, &nvgvramtotal, 0, "NVIDIA GPU VRAM total MB");
+SYSCTL_INT(_kern, OID_AUTO, nvgvramused, CTLFLAG_RD, &nvgvramused, 0, "NVIDIA GPU VRAM used MB");
+SYSCTL_INT(_kern, OID_AUTO, nvgpstate, CTLFLAG_RD, &nvgpstate, 0, "NVIDIA GPU current P-state");
 
 SYSCTL_INT(_kern, OID_AUTO, nvgpupower, CTLFLAG_RD, &nvgpupower, 0, "NVIDIA GPU average power mW (RUSD)");
 SYSCTL_INT(_kern, OID_AUTO, nvgpupower_mod, CTLFLAG_RD, &nvgpupower_mod, 0, "NVIDIA GPU module power mW (RUSD)");
