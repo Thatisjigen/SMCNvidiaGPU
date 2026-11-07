@@ -352,6 +352,7 @@ static bool nvrm_bind(IOService *nvrm)
         return false;
     NVRMSmcApi api = {};
     api.version = NVRM_SMC_API_VERSION;
+    api.size = sizeof(api);   /* also an input: an NVRM that checks it can tell our buffer from a short one */
     const IOReturn r = nvrm->callPlatformFunction(fn, false, &api, nullptr, nullptr, nullptr);
     fn->release();
     if (r != kIOReturnSuccess || api.size != sizeof(api) || !api.gpumgrGetGpu || !api.createRusd || !api.linkRusd ||
