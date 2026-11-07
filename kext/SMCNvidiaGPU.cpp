@@ -824,9 +824,8 @@ bool SMCNvidiaGPU::ensureRusd()
     memdesc = *(volatile UInt64 *)(base + OFF_USD_PMEMDESC);
     mapping = *(volatile UInt64 *)(base + OFF_USD_PMAPBUFFER);
     fRusd = (volatile UInt8 *)(uintptr_t)mapping;
-    SMCNVG_LOG("RUSD block allocated by the driver (pMemDesc %p, mapping %p)",
-               (void *)(uintptr_t)memdesc, (void *)fRusd);
-    nvsens_state_set("rusd created, mapping %p", (void *)fRusd);
+    SMCNVG_LOG("RUSD block allocated by the driver");
+    nvsens_state_set("rusd created");
     return fRusd != nullptr;
 }
 
@@ -1820,7 +1819,7 @@ void SMCNvidiaGPU::tick()
                         fGpu = candidate;
                 }
                 if (fGpu)
-                    SMCNVG_LOG("OBJGPU %p", fGpu);
+                    SMCNVG_LOG("OBJGPU found");
                 else
                     nvsens_state_set("waiting for NVRM to attach the GPU");
             }
