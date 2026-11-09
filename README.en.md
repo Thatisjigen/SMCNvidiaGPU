@@ -7,8 +7,9 @@
 > - The kext asks NVRM for its entry points and OBJGPU field offsets with `callPlatformFunction("NVRMSmcApi")`, which NVRM's own
 >   compiler fills in (`kext/nvrm_smc_abi.h`). No table, no hash and no UUID comparison: a rebuilt NVRM needs nothing from this kext.
 >   An NVRM without that call is left alone and `kern.nvgpustate` says so. `nvsensoff=1` stays.
-> - When NVRM also states the range it is loaded at, every entry point is checked against it before any is called, and
->   `kern.nvgpulayout` reads 2. An NVRM that states none is bound as before, unchecked, and it reads 1.
+> - When NVRM also states the range it is loaded at, every entry point is checked against it before any is called,
+>   together with the code that answered the call, and `kern.nvgpulayout` reads 2. An NVRM that states none is bound as
+>   before, unchecked, and it reads 1.
 > - RM calls hold the GPU locks as well as the API lock.
 > - The kext does not map the GPU's expansion ROM, does not rename the GPU, and publishes nothing while unbound.
 > - RUSD temperatures are decoded as 24.8 fixed point, the P-state bit becomes its number, and the ECC offset is corrected.

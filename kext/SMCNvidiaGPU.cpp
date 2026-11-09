@@ -23,7 +23,8 @@
  * com.nullmoth.NVRM. Instead it asks the driver at run time: NVRM answers callPlatformFunction("NVRMSmcApi") with
  * its entry points and OBJGPU field offsets, which its own compiler filled in, so nothing here depends on one
  * build of NVRM. A driver without that call is left alone and the sensors stay at zero. When NVRM also states the
- * range it is loaded at, every entry point is checked against it before any is called.
+ * range it is loaded at, every entry point is checked against it before any is called, and so is the code that
+ * answered the call.
  *
  * With the entry points in hand it does what the driver would do:
  *   gpuCreateRusdMemory(OBJGPU *)  allocate + map the RUSD block, hand it to the GSP, set up polling
@@ -379,10 +380,16 @@ static bool nvrm_bind(IOService *nvrm)
      * compare with and is bound as before. */
     const bool stated = api.size == sizeof(api) && (api.kextStart || api.kextSize);
     if (stated) {
-        static const char *const name[] = { "gpumgrGetGpu", "createRusd", "linkRusd", "lock",   "unlock",
-                                            "gpuLock",      "gpuUnlock",  "pmEnter",  "pmExit" };
-        void *const entry[] = { api.gpumgrGetGpu, api.createRusd, api.linkRusd, api.lock,   api.unlock,
-                                api.gpuLock,      api.gpuUnlock,  api.pmEnter,  api.pmExit };
+        /* The range arrives in the same answer as the entry points. One address here does not: the code that answered,
+         * which is what this service's own vtable holds for the call just made. It has to lie in the range as well, so
+         * that the range is at least that of whoever answered. */
+        typedef IOReturn (IOService::*PlatformCall)(const OSSymbol *, bool, void *, void *, void *, void *);
+        void *const answered =
+            OSMemberFunctionCast(void *, nvrm, static_cast<PlatformCall>(&IOService::callPlatformFunction));
+        static const char *const name[] = { "callPlatformFunction", "gpumgrGetGpu", "createRusd", "linkRusd", "lock",
+                                            "unlock",               "gpuLock",      "gpuUnlock",  "pmEnter",  "pmExit" };
+        void *const entry[] = { answered,   api.gpumgrGetGpu, api.createRusd, api.linkRusd, api.lock,
+                                api.unlock, api.gpuLock,      api.gpuUnlock,  api.pmEnter,  api.pmExit };
         for (unsigned int i = 0; i < sizeof(entry) / sizeof(entry[0]); i++) {
             const unsigned long long at = (unsigned long long)entry[i];
             if (at < api.kextStart || at - api.kextStart >= api.kextSize) {
