@@ -22,7 +22,8 @@
  * boot kernel collection *before* the NullMoth driver (auxiliary collection), so it cannot link against
  * com.nullmoth.NVRM. Instead it asks the driver at run time: NVRM answers callPlatformFunction("NVRMSmcApi") with
  * its entry points and OBJGPU field offsets, which its own compiler filled in, so nothing here depends on one
- * build of NVRM. A driver without that call is left alone and the sensors stay at zero.
+ * build of NVRM. A driver without that call is left alone and the sensors stay at zero. When NVRM also states the
+ * range it is loaded at, every entry point is checked against it before any is called.
  *
  * With the entry points in hand it does what the driver would do:
  *   gpuCreateRusdMemory(OBJGPU *)  allocate + map the RUSD block, hand it to the GSP, set up polling
@@ -241,7 +242,8 @@ SYSCTL_STRING(_kern, OID_AUTO, nvgpuvbios_override, CTLFLAG_RW, nvgpuvbios_overr
 SYSCTL_INT(_kern, OID_AUTO, nvgpurombar, CTLFLAG_RD, &nvgpurombar, 0, "PCI expansion ROM BAR value");
 SYSCTL_INT(_kern, OID_AUTO, nvgpurdrom, CTLFLAG_RD, &nvgpurdrom, 0, "ROM read diagnostics bits");
 SYSCTL_INT(_kern, OID_AUTO, nvgpulive, CTLFLAG_RD, &nvgpulive, 0, "NVIDIA RUSD data updated recently");
-SYSCTL_INT(_kern, OID_AUTO, nvgpulayout, CTLFLAG_RD, &nvgpulayout, 0, "bound to NVRM's interface");
+SYSCTL_INT(_kern, OID_AUTO, nvgpulayout, CTLFLAG_RD, &nvgpulayout, 0,
+           "bound to NVRM's interface: 2 with its entry points checked against the range it states, 1 when it states none");
 SYSCTL_INT(_kern, OID_AUTO, nvgpupoll, CTLFLAG_RD, &nvgpupoll, 0, "GSP accepted the RUSD poll request");
 SYSCTL_STRING(_kern, OID_AUTO, nvgpustate, CTLFLAG_RD, nvgpustate, sizeof(nvgpustate), "SMCNvidiaGPU last state");
 
@@ -340,6 +342,15 @@ static void nvsens_state_set(const char *fmt, ...)
     va_end(ap);
 }
 
+/* One request for NVRM's interface, from a caller that has `have` bytes of the struct. */
+static IOReturn nvrm_ask(IOService *nvrm, const OSSymbol *fn, NVRMSmcApi &api, unsigned int have)
+{
+    api = {};
+    api.version = NVRM_SMC_API_VERSION;
+    api.size = have;
+    return nvrm->callPlatformFunction(fn, false, &api, nullptr, nullptr, nullptr);
+}
+
 /* NVRM says what it has, from its own compiler, on every build. An NVRM without the call is left alone. */
 static bool nvrm_bind(IOService *nvrm)
 {
@@ -350,15 +361,40 @@ static bool nvrm_bind(IOService *nvrm)
     const OSSymbol *fn = OSSymbol::withCString(NVRM_SMC_API_FN);
     if (!fn)
         return false;
-    NVRMSmcApi api = {};
-    api.version = NVRM_SMC_API_VERSION;
-    api.size = sizeof(api);   /* also an input: an NVRM that checks it can tell our buffer from a short one */
-    const IOReturn r = nvrm->callPlatformFunction(fn, false, &api, nullptr, nullptr, nullptr);
+    NVRMSmcApi api;
+    IOReturn r = nvrm_ask(nvrm, fn, api, sizeof(api));
+    /* An NVRM built before the struct grew may refuse a size that is not its own: ask again as a caller of that size. */
+    if (r == kIOReturnBadArgument)
+        r = nvrm_ask(nvrm, fn, api, NVRM_SMC_API_SIZE_V1);
     fn->release();
-    if (r != kIOReturnSuccess || api.size != sizeof(api) || !api.gpumgrGetGpu || !api.createRusd || !api.linkRusd ||
-        !api.lock || !api.unlock || !api.gpuLock || !api.gpuUnlock || !api.pmEnter || !api.pmExit) {
+    if (r != kIOReturnSuccess || (api.size != sizeof(api) && api.size != NVRM_SMC_API_SIZE_V1) || !api.gpumgrGetGpu ||
+        !api.createRusd || !api.linkRusd || !api.lock || !api.unlock || !api.gpuLock || !api.gpuUnlock || !api.pmEnter ||
+        !api.pmExit) {
         nvsens_state_set("this NVRM has no sensor interface (0x%x): build it from the same fork", r);
         return false;
+    }
+    /* The entry points are about to be called in the kernel with RM's locks held, and so far only their being non-null
+     * was checked. An NVRM that states where it is loaded gets each of them compared with that range first. One that
+     * filled only the short struct, where the two fields are still our zeroes, or left them 0 itself, gives nothing to
+     * compare with and is bound as before. */
+    const bool stated = api.size == sizeof(api) && (api.kextStart || api.kextSize);
+    if (stated) {
+        static const char *const name[] = { "gpumgrGetGpu", "createRusd", "linkRusd", "lock",   "unlock",
+                                            "gpuLock",      "gpuUnlock",  "pmEnter",  "pmExit" };
+        void *const entry[] = { api.gpumgrGetGpu, api.createRusd, api.linkRusd, api.lock,   api.unlock,
+                                api.gpuLock,      api.gpuUnlock,  api.pmEnter,  api.pmExit };
+        for (unsigned int i = 0; i < sizeof(entry) / sizeof(entry[0]); i++) {
+            const unsigned long long at = (unsigned long long)entry[i];
+            if (at < api.kextStart || at - api.kextStart >= api.kextSize) {
+                static bool said;
+                if (!said) {
+                    said = true;
+                    SMCNVG_LOG("NVRM's %s is outside the range NVRM states for itself: interface refused", name[i]);
+                }
+                nvsens_state_set("NVRM's %s is outside the range NVRM states for itself: interface refused", name[i]);
+                return false;
+            }
+        }
     }
     gApi.gpu = (void *(*)(unsigned int))api.gpumgrGetGpu;
     gApi.createRusd = (int (*)(void *))api.createRusd;
@@ -377,9 +413,10 @@ static bool nvrm_bind(IOService *nvrm)
     OFF_USD_PMAPBUFFER = api.usdMapBuffer;
     OFF_USD_DATA = api.usdData;
     gNvrmBound = true;
-    nvgpulayout = 1;
-    SMCNVG_LOG("bound NVRM through its interface, version %u", api.version);
-    nvsens_state_set("bound NVRM through its interface");
+    nvgpulayout = stated ? 2 : 1;
+    const char *const checked = stated ? "checked against the range it states" : "not checked: it states no range";
+    SMCNVG_LOG("bound NVRM through its interface, version %u, entry points %s", api.version, checked);
+    nvsens_state_set("bound NVRM through its interface, entry points %s", checked);
     return true;
 }
 /* Run one RM operation with the GPU kept awake and the API and GPU locks held, in RM's order. Without the GPU locks
