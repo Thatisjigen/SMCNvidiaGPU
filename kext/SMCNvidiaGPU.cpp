@@ -75,6 +75,7 @@ static char nvgpufanraw[160] = "";     /* rpmCurr[0..15] as reported, for diagno
 static int nvgpusmclk = 0, nvgpugfxclk = 0, nvgpurusdtemp = 0;
 #define NVGPUTHERM_MAX 16
 static int nvgpurusdtemps[5] = {0, 0, 0, 0, 0};   /* every NV00DE temperature sensor, in C */
+static int nvgpuvramtemp = 0;                      /* NV00DE temperatures[MEMORY] (sensor 1), in C; 0 when the card reports none */
 static int nvgpuprocutil = 0;                      /* GR utilisation of the busiest recent sample, % */
 static int nvgpuprocutilfb = 0;                    /* FB (memory) utilisation, % */
 static int nvgpuprocpid = 0;
@@ -212,6 +213,7 @@ SYSCTL_INT(_kern, OID_AUTO, nvgpurusdtemp1, CTLFLAG_RD, &nvgpurusdtemps[1], 0, "
 SYSCTL_INT(_kern, OID_AUTO, nvgpurusdtemp2, CTLFLAG_RD, &nvgpurusdtemps[2], 0, "NVIDIA RUSD temperature sensor 2 C");
 SYSCTL_INT(_kern, OID_AUTO, nvgpurusdtemp3, CTLFLAG_RD, &nvgpurusdtemps[3], 0, "NVIDIA RUSD temperature sensor 3 C");
 SYSCTL_INT(_kern, OID_AUTO, nvgpurusdtemp4, CTLFLAG_RD, &nvgpurusdtemps[4], 0, "NVIDIA RUSD temperature sensor 4 C");
+SYSCTL_INT(_kern, OID_AUTO, nvgpuvramtemp, CTLFLAG_RD, &nvgpuvramtemp, 0, "NVIDIA GPU memory temperature C (RUSD, 0 when absent)");
 SYSCTL_INT(_kern, OID_AUTO, nvgputemp_mode, CTLFLAG_RW, &nvgputemp_mode, 0, "GPU temperature source: 0 = RM edge, 1..5 = RUSD sensor");
 SYSCTL_INT(_kern, OID_AUTO, nvgpuinstpower, CTLFLAG_RD, &nvgpuinstpower, 0, "NVIDIA instant GPU power mW (RUSD)");
 SYSCTL_INT(_kern, OID_AUTO, nvgpuinstpower_mod, CTLFLAG_RD, &nvgpuinstpower_mod, 0, "NVIDIA instant module power mW (RUSD)");
@@ -660,6 +662,7 @@ void SMCNvidiaGPU::registerSysctls()
     sysctl_register_oid(&sysctl__kern_nvgpurusdtemp2);
     sysctl_register_oid(&sysctl__kern_nvgpurusdtemp3);
     sysctl_register_oid(&sysctl__kern_nvgpurusdtemp4);
+    sysctl_register_oid(&sysctl__kern_nvgpuvramtemp);
     sysctl_register_oid(&sysctl__kern_nvgputemp_mode);
     sysctl_register_oid(&sysctl__kern_nvgpuinstpower);
     sysctl_register_oid(&sysctl__kern_nvgpuinstpower_mod);
@@ -773,6 +776,7 @@ void SMCNvidiaGPU::unregisterSysctls()
     sysctl_unregister_oid(&sysctl__kern_nvgpurusdtemp2);
     sysctl_unregister_oid(&sysctl__kern_nvgpurusdtemp3);
     sysctl_unregister_oid(&sysctl__kern_nvgpurusdtemp4);
+    sysctl_unregister_oid(&sysctl__kern_nvgpuvramtemp);
     sysctl_unregister_oid(&sysctl__kern_nvgputemp_mode);
     sysctl_unregister_oid(&sysctl__kern_nvgpuinstpower);
     sysctl_unregister_oid(&sysctl__kern_nvgpuinstpower_mod);
@@ -1454,6 +1458,7 @@ void SMCNvidiaGPU::readRusd()
         if (celsius > 0 && celsius < 150) nvgpurusdtemps[i] = celsius;
     }
     nvgpurusdtemp = nvgpurusdtemps[0];
+    nvgpuvramtemp = nvgpurusdtemps[1];   /* NV00DE temperatures[MEMORY]; matches SMCNvidiaGPU upstream's nvgpuvramtemp */
 
     struct { UInt64 ts; UInt32 reasonMask, pad; } thr;
     if (nvsens_read_polled(b, RUSD_OFF_CLK_THROTTLE, &thr, sizeof(thr), &thr.ts)) {
