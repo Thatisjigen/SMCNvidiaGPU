@@ -514,6 +514,18 @@ protected:
     }
 };
 
+/// GPU memory (VRAM) temperature, so iStat Menus and other SMC readers see it next to the GPU die key.
+/// nvgpuvramtemp is 0 when the card reports no memory sensor, which reads back as not-readable.
+class GPUVramTempValue : public VirtualSMCValue {
+protected:
+    SMC_RESULT readAccess() override {
+        int t = nvgpuvramtemp;
+        if (t < 1 || t > 125) return SmcNotReadable;
+        *reinterpret_cast<uint16_t *>(data) = VirtualSMCAPI::encodeIntSp(SmcKeyTypeSp78, t);
+        return SmcSuccess;
+    }
+};
+
 /// GPU fan speed (fpe2, the type Apple uses for F0Ac..): read straight from the RUSD per-fan array.
 class GPUFanSpeedValue : public VirtualSMCValue {
     unsigned int fIndex;
@@ -1977,6 +1989,7 @@ bool SMCNvidiaGPU::start(IOService *provider)
     VirtualSMCAPI::addKey(SMC_MAKE_IDENTIFIER('T','G','0','D'), vsmcPlugin.data, VirtualSMCAPI::valueWithSp(0, SmcKeyTypeSp78, new GPUTempValue()));
     VirtualSMCAPI::addKey(SMC_MAKE_IDENTIFIER('T','G','0','P'), vsmcPlugin.data, VirtualSMCAPI::valueWithSp(0, SmcKeyTypeSp78, new GPUTempValue()));
     VirtualSMCAPI::addKey(SMC_MAKE_IDENTIFIER('T','G','0','d'), vsmcPlugin.data, VirtualSMCAPI::valueWithSp(0, SmcKeyTypeSp78, new GPUTempValue()));
+    VirtualSMCAPI::addKey(SMC_MAKE_IDENTIFIER('T','G','0','M'), vsmcPlugin.data, VirtualSMCAPI::valueWithSp(0, SmcKeyTypeSp78, new GPUVramTempValue()));
 
     /* GPU fans are published as SMC fan slots 2 and 3, the SuperIO slots that report 0 RPM on this board.
      * VirtualSMCKeystore::loadPlugin() lets a later plugin replace an existing key, which is how these take

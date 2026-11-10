@@ -165,6 +165,7 @@ SMC keys:
 | Key | Content |
 |---|---|
 | `TG0D` `TG0P` `TG0d` `TG0p` | GPU temperature (sp78) |
+| `TG0M` | GPU memory (VRAM) temperature (sp78), also `kern.nvgpuvramtemp`; not published when the card reports no memory sensor |
 | `F2Ac` `F3Ac` | GPU fan 1/2 RPM (fpe2) |
 | `F2Mn` `F2Mx` `F3Mn` `F3Mx` | RPM limits |
 | `F2ID` `F3ID` | Fan names (ch8*) |
