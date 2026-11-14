@@ -112,6 +112,7 @@ static char nvgpuvbios_override[64] = "";   /* user-supplied VBIOS version, used
 static int nvgpurombar = 0;                 /* raw PCI expansion ROM BAR value */
 static int nvgpurdrom = 0;                  /* diagnostics: 1 mapped, 2 signature ok, 4 version found, 8 map failed */
 static int nvgpulive = 0, nvgpulayout = 0, nvgpupoll = 0;
+static int nvgrmslow = 0;   /* ms of the RM call that stopped the RM-side sampling for this boot, 0 = never */
 static int nvgpuforced = 0;      /* always 0 on this branch: nvsmcforce is gone, the sysctl stays for the app */
 
 /* RM-side sensors are read here now (see nvsmc_rm_* below); the daemon is no longer required. */
@@ -245,6 +246,8 @@ SYSCTL_STRING(_kern, OID_AUTO, nvgpuvbios_override, CTLFLAG_RW, nvgpuvbios_overr
 SYSCTL_INT(_kern, OID_AUTO, nvgpurombar, CTLFLAG_RD, &nvgpurombar, 0, "PCI expansion ROM BAR value");
 SYSCTL_INT(_kern, OID_AUTO, nvgpurdrom, CTLFLAG_RD, &nvgpurdrom, 0, "ROM read diagnostics bits");
 SYSCTL_INT(_kern, OID_AUTO, nvgpulive, CTLFLAG_RD, &nvgpulive, 0, "NVIDIA RUSD data updated recently");
+SYSCTL_INT(_kern, OID_AUTO, nvgrmslow, CTLFLAG_RD, &nvgrmslow, 0,
+           "ms an RM call took inside RM's locks when it went over 500 ms; RM calls stop for this boot, 0 = never");
 SYSCTL_INT(_kern, OID_AUTO, nvgpulayout, CTLFLAG_RD, &nvgpulayout, 0,
            "bound to NVRM's interface: 2 with its entry points checked against the range it states, 1 when it states none");
 SYSCTL_INT(_kern, OID_AUTO, nvgpupoll, CTLFLAG_RD, &nvgpupoll, 0, "GSP accepted the RUSD poll request");
@@ -430,23 +433,39 @@ static bool nvrm_bind(IOService *nvrm)
 }
 /* Run one RM operation with the GPU kept awake and the API and GPU locks held, in RM's order. Without the GPU locks
  * rpcRmApiControl_GSP takes them itself, but only after logging "without adequate locks" and an assert ("RPC locking
- * violation") on every call, a few lines a second for as long as the kext runs. */
+ * violation") on every call, a few lines a second for as long as the kext runs.
+ *
+ * A firmware call that does not come back holds RM's API lock, taken for writing, for as long as it lasts, and every
+ * other RM client waits behind it: WindowServer, and at shutdown the whole system. NVRM stops its own utilisation
+ * sampler when one read takes more than 500 ms; the same reads, and the others made here, stop here too. Only the time
+ * inside the locks counts: waiting for them while another client holds them keeps nobody else waiting. */
+static const UInt64 kRmCallLimitNs = 500ull * 1000 * 1000;
+
 template <typename Body>
 static int nvsens_rm_call(Body body)
 {
-    if (!gApi.lock || !gApi.gpuLock || !gApi.pmEnter || !gApi.pmExit)
+    if (nvgrmslow || !gApi.lock || !gApi.gpuLock || !gApi.pmEnter || !gApi.pmExit)
         return -1;
     int counted = gApi.pmEnter();
     int status = gApi.lock(RMSG_LOCK_WRITE, RMSG_MODULE_WORKITEM);
+    UInt64 heldNs = 0;
     if (status == 0) {
         status = gApi.gpuLock(GPUS_LOCK_FLAGS_NONE, RMSG_MODULE_WORKITEM);
         if (status == 0) {
+            const UInt64 t0 = nvsens_now_ns();
             status = body();
+            heldNs = nvsens_now_ns() - t0;
             gApi.gpuUnlock(GPUS_LOCK_FLAGS_NONE, nullptr);
         }
         gApi.unlock();
     }
     gApi.pmExit(counted);
+    if (heldNs > kRmCallLimitNs) {
+        nvgrmslow = (int)(heldNs / 1000000ull);
+        SMCNVG_LOG("an RM call took %d ms inside RM's locks (limit 500): no more RM calls this boot, RUSD values stay",
+                   nvgrmslow);
+        nvsens_state_set("RM calls stopped: one took %d ms", nvgrmslow);
+    }
     return status;
 }
 
@@ -704,6 +723,7 @@ void SMCNvidiaGPU::registerSysctls()
     sysctl_register_oid(&sysctl__kern_nvgpurombar);
     sysctl_register_oid(&sysctl__kern_nvgpurdrom);
     sysctl_register_oid(&sysctl__kern_nvgpulive);
+    sysctl_register_oid(&sysctl__kern_nvgrmslow);
     sysctl_register_oid(&sysctl__kern_nvgpulayout);
     sysctl_register_oid(&sysctl__kern_nvgpupoll);
     sysctl_register_oid(&sysctl__kern_nvgpustate);
@@ -818,6 +838,7 @@ void SMCNvidiaGPU::unregisterSysctls()
     sysctl_unregister_oid(&sysctl__kern_nvgpurombar);
     sysctl_unregister_oid(&sysctl__kern_nvgpurdrom);
     sysctl_unregister_oid(&sysctl__kern_nvgpulive);
+    sysctl_unregister_oid(&sysctl__kern_nvgrmslow);
     sysctl_unregister_oid(&sysctl__kern_nvgpulayout);
     sysctl_unregister_oid(&sysctl__kern_nvgpupoll);
     sysctl_unregister_oid(&sysctl__kern_nvgpustate);
