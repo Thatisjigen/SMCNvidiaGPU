@@ -112,6 +112,7 @@ static char nvgpuvbios_override[64] = "";   /* user-supplied VBIOS version, used
 static int nvgpurombar = 0;                 /* raw PCI expansion ROM BAR value */
 static int nvgpurdrom = 0;                  /* diagnostics: 1 mapped, 2 signature ok, 4 version found, 8 map failed */
 static int nvgpulive = 0, nvgpulayout = 0, nvgpupoll = 0;
+static int nvgutilsrc = 0;  /* where kern.nvgutil* came from last: 1 NVAccel's PerformanceStatistics, 2 RM, 0 none */
 static int nvgrmslow = 0;   /* ms of the RM call that stopped the RM-side sampling for this boot, 0 = never */
 static int nvgpuforced = 0;      /* always 0 on this branch: nvsmcforce is gone, the sysctl stays for the app */
 
@@ -246,6 +247,8 @@ SYSCTL_STRING(_kern, OID_AUTO, nvgpuvbios_override, CTLFLAG_RW, nvgpuvbios_overr
 SYSCTL_INT(_kern, OID_AUTO, nvgpurombar, CTLFLAG_RD, &nvgpurombar, 0, "PCI expansion ROM BAR value");
 SYSCTL_INT(_kern, OID_AUTO, nvgpurdrom, CTLFLAG_RD, &nvgpurdrom, 0, "ROM read diagnostics bits");
 SYSCTL_INT(_kern, OID_AUTO, nvgpulive, CTLFLAG_RD, &nvgpulive, 0, "NVIDIA RUSD data updated recently");
+SYSCTL_INT(_kern, OID_AUTO, nvgutilsrc, CTLFLAG_RD, &nvgutilsrc, 0,
+           "source of the utilisation values: 1 NVAccel, 2 RM, 0 none yet");
 SYSCTL_INT(_kern, OID_AUTO, nvgrmslow, CTLFLAG_RD, &nvgrmslow, 0,
            "ms an RM call took inside RM's locks when it went over 500 ms; RM calls stop for this boot, 0 = never");
 SYSCTL_INT(_kern, OID_AUTO, nvgpulayout, CTLFLAG_RD, &nvgpulayout, 0,
@@ -615,6 +618,7 @@ private:
     void readRusd();
     void publish();
     IOService *accel();
+    bool utilFromAccel();
 };
 
 OSDefineMetaClassAndStructors(SMCNvidiaGPU, IOService)
@@ -725,6 +729,7 @@ void SMCNvidiaGPU::registerSysctls()
     sysctl_register_oid(&sysctl__kern_nvgpurdrom);
     sysctl_register_oid(&sysctl__kern_nvgpulive);
     sysctl_register_oid(&sysctl__kern_nvgrmslow);
+    sysctl_register_oid(&sysctl__kern_nvgutilsrc);
     sysctl_register_oid(&sysctl__kern_nvgpulayout);
     sysctl_register_oid(&sysctl__kern_nvgpupoll);
     sysctl_register_oid(&sysctl__kern_nvgpustate);
@@ -840,6 +845,7 @@ void SMCNvidiaGPU::unregisterSysctls()
     sysctl_unregister_oid(&sysctl__kern_nvgpurdrom);
     sysctl_unregister_oid(&sysctl__kern_nvgpulive);
     sysctl_unregister_oid(&sysctl__kern_nvgrmslow);
+    sysctl_unregister_oid(&sysctl__kern_nvgutilsrc);
     sysctl_unregister_oid(&sysctl__kern_nvgpulayout);
     sysctl_unregister_oid(&sysctl__kern_nvgpupoll);
     sysctl_unregister_oid(&sysctl__kern_nvgpustate);
@@ -1760,6 +1766,36 @@ IOService *SMCNvidiaGPU::accel()
     return fAccel;
 }
 
+/* NVAccel's own keys, whole percent of the newest sample, removed when its sample is older than 5 s: "GPU Core
+ * Utilization %" is the graphics engine, then memory, the encoder ("Video Engine") and the decoder. The keys this kext
+ * writes into the same dictionary have other names, so what is read here is always NVAccel's. */
+bool SMCNvidiaGPU::utilFromAccel()
+{
+    IOService *svc = accel();
+    if (!svc)
+        return false;
+    OSObject *prop = svc->copyProperty("PerformanceStatistics");
+    OSDictionary *d = OSDynamicCast(OSDictionary, prop);
+    bool ok = false;
+    if (d) {
+        OSNumber *gr = OSDynamicCast(OSNumber, d->getObject("GPU Core Utilization %"));
+        OSNumber *fb = OSDynamicCast(OSNumber, d->getObject("GPU Memory Utilization %"));
+        OSNumber *enc = OSDynamicCast(OSNumber, d->getObject("GPU Video Engine Utilization %"));
+        OSNumber *dec = OSDynamicCast(OSNumber, d->getObject("GPU Video Decode Utilization %"));
+        if (gr && fb && enc && dec && gr->unsigned32BitValue() <= 100 && fb->unsigned32BitValue() <= 100 &&
+            enc->unsigned32BitValue() <= 100 && dec->unsigned32BitValue() <= 100) {
+            nvgutil = (int)gr->unsigned32BitValue() * 100;      /* kern.nvgutil* stay in hundredths of a percent */
+            nvgutilfb = (int)fb->unsigned32BitValue() * 100;
+            nvgutilenc = (int)enc->unsigned32BitValue() * 100;
+            nvgutildec = (int)dec->unsigned32BitValue() * 100;
+            ok = true;
+        }
+    }
+    if (prop)
+        prop->release();
+    return ok;
+}
+
 void SMCNvidiaGPU::publish()
 {
     IOService *svc = accel();
@@ -1938,7 +1974,14 @@ void SMCNvidiaGPU::tick()
                 int t = nvsmc_rm_temperature(fGpu, &status);
                 if (t >= 1 && t <= 125) nvgputemp = t;
             }
-            nvsmc_rm_util(fGpu);
+            /* NVAccel reads the same per-engine ring once a second through NVRMGpuUtilization and publishes it in the
+             * PerformanceStatistics this kext merges into: taking it from there leaves one reader of that 55 888-byte
+             * control instead of two, each under RM's write lock. RM is asked only when NVAccel publishes nothing (not
+             * attached yet, or its sampler stopped and removed the keys). */
+            if (utilFromAccel())
+                nvgutilsrc = 1;
+            else if (nvsmc_rm_util(fGpu))
+                nvgutilsrc = 2;
         }
         if ((fTicks % 4) == 0) {
             nvsmc_rm_clocks(fGpu);
