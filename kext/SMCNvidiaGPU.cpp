@@ -508,7 +508,8 @@ static void nvsmc_read_pcie_bus(void *pGpu)
     }
 }
 
-/* What the SMC keys and PerformanceStatistics report. Default is the RM edge sensor; setting
+/* What the SMC keys and PerformanceStatistics report. Default is the edge sensor (RUSD's sensor 0 while the page is
+ * live, RM otherwise); setting
  * kern.nvgputemp_mode = N (1..5) switches to one of RUSD's sensors, which on this board means the hotter
  * hotspot/memory readings — useful because AMD Power Gadget treats anything under 50 C as "Zero RPM Mode"
  * and stops showing the fan. */
@@ -601,7 +602,7 @@ private:
     UInt32 fTicks {0}, fCreateTries {0}, fRelinkTries {0}, fLastPoll {0};
     UInt64 fTsPower {0}, fTsFan {0}, fTsLimit {0}, fTsPolicy {0}, fTsPstate {0}, fTsClk {0}, fTsTemp {0};
     UInt64 fTsInst {0}, fTsPci {0}, fTsEcc {0}, fTsThrottle {0};
-    UInt64 fChangedNs {0};
+    UInt64 fChangedNs {0}, fTempNs {0};
     bool fBound {false}, fCreateFailedLogged {false}, fSysctls {false}, fVbiosTried {false};
 
     static void onTimer(OSObject *owner, IOTimerEventSource *src);
@@ -1484,7 +1485,7 @@ void SMCNvidiaGPU::readRusd()
         struct { UInt64 ts; SInt32 temp; UInt32 pad; } temp;
         if (!nvsens_read_polled(b, RUSD_OFF_TEMPERATURES + (UInt32)i * RUSD_TEMP_STRIDE, &temp, sizeof(temp), &temp.ts))
             continue;
-        if (i == 0 && temp.ts != fTsTemp) { fTsTemp = temp.ts; anyNew = true; }
+        if (i == 0 && temp.ts != fTsTemp) { fTsTemp = temp.ts; fTempNs = now; anyNew = true; }
         /* NvTemp is signed 24.8 fixed point (nvfixedtypes.h): on the RTX 5050 the page holds 13424 for 52.4 C, which
          * the old check for 0..150 dropped, so every RUSD sensor read 0. */
         int celsius = (int)temp.temp / 256;
@@ -1926,9 +1927,17 @@ void SMCNvidiaGPU::tick()
     /* RM-side sensors: temperature and utilisation every 500 ms, clocks and VRAM every second. */
     if (fGpu && nvgpulayout) {
         if ((fTicks % 2) == 0) {
-            int status = 0;
-            int t = nvsmc_rm_temperature(fGpu, &status);
-            if (t >= 1 && t <= 125) nvgputemp = t;
+            /* RUSD's sensor 0 reads what THERMAL_SYSTEM_EXECUTE gives for sensor 0 (the same degree, read side by side
+             * on the RTX 5050), and the GSP keeps it current while the poll is on: RM is asked only when that sample
+             * has not moved for 3 s, which spares one call under RM's write lock every 2 s. */
+            const int rt = nvgpurusdtemps[0];
+            if (fTempNs != 0 && nvsens_now_ns() - fTempNs < 3000000000ull && rt >= 1 && rt <= 125) {
+                nvgputemp = rt;
+            } else {
+                int status = 0;
+                int t = nvsmc_rm_temperature(fGpu, &status);
+                if (t >= 1 && t <= 125) nvgputemp = t;
+            }
             nvsmc_rm_util(fGpu);
         }
         if ((fTicks % 4) == 0) {
